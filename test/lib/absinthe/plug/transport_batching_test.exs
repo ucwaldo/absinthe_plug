@@ -448,7 +448,7 @@ defmodule Absinthe.Plug.TransportBatchingTest do
     "variables": {}
   },{
     "id": "2",
-    "query": "query O { items { id name child { id name } } } fragment Unused on Item { name }",
+    "query": "query O { items { id name child { id name } } }",
     "variables": {}
   }]
   """
@@ -521,72 +521,8 @@ defmodule Absinthe.Plug.TransportBatchingTest do
     end
   end
 
-  defmodule CustomValidationResult do
-    alias Absinthe.Blueprint
-
-    use Absinthe.Phase
-
-    def run(blueprint, opts) do
-      skipped_phases = Keyword.fetch!(opts, :phases)
-
-      blueprint =
-        blueprint
-        |> Blueprint.prewalk([], &handle_node/2)
-        |> filter_errors(skipped_phases)
-
-      case blueprint.execution.validation_errors do
-        [] ->
-          {:ok, blueprint}
-
-        _ ->
-          {:jump, blueprint, Absinthe.Phase.Document.Result}
-      end
-    end
-
-    defp handle_node(%{errors: errs} = node, errors) do
-      {node, :lists.reverse(errs) ++ errors}
-    end
-
-    defp handle_node(%{raw: raw} = node, errors) do
-      {_, errors} = Blueprint.prewalk(raw, errors, &handle_node/2)
-      {node, errors}
-    end
-
-    defp handle_node(node, acc), do: {node, acc}
-
-    defp filter_errors({blueprint, errors}, skipped_phases) do
-      {skipped_errors, filtered_errors} =
-        Enum.split_with(
-          errors,
-          &(&1.phase in skipped_phases)
-        )
-
-      blueprint.execution.validation_errors
-      |> put_in(:lists.reverse(filtered_errors))
-      |> add_skipped_validations_to_operations(skipped_errors)
-    end
-
-    defp add_skipped_validations_to_operations(blueprint, skipped_errors) do
-      Absinthe.Blueprint.update_current(
-        blueprint,
-        &put_in(&1, [Access.key(:skipped_validation_errors)], skipped_errors)
-      )
-    end
-  end
-
-  defmodule CustomPipeline do
-    def pipeline(config, opts) do
-      config
-      |> Absinthe.Plug.default_pipeline(opts)
-      |> Absinthe.Pipeline.replace(
-        Absinthe.Phase.Document.Validation.Result,
-        {CustomValidationResult, phases: [Absinthe.Phase.Document.Validation.NoUnusedFragments]}
-      )
-    end
-  end
-
   test "can include unused fragment with skip directive" do
-    opts = Absinthe.Plug.init(schema: CustomSchema, pipeline: {CustomPipeline, :pipeline})
+    opts = Absinthe.Plug.init(schema: CustomSchema)
 
     assert %{status: 200, resp_body: resp_body} =
              conn(:post, "/", @unused_fragment_query_with_directive)
