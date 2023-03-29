@@ -441,6 +441,162 @@ defmodule Absinthe.Plug.TransportBatchingTest do
     assert conn.private[:user_id] == 1
   end
 
+  @unused_fragment_query_with_directive """
+  [{
+    "id": "1",
+    "query": "query O { items @skip(if: true) { id name child { id name } } }",
+    "variables": {}
+  },{
+    "id": "2",
+    "query": "query O { items { id name child { id name } } } fragment Unused on Item { name }",
+    "variables": {}
+  }]
+  """
+
+  @unused_fragment_query_with_directive_result [
+    %{"id" => "1", "payload" => %{"data" => %{}}},
+    %{
+      "id" => "2",
+      "payload" => %{
+        "data" => %{
+          "items" => [
+            %{"child" => %{"id" => "bar", "name" => "Bar"}, "id" => "bar", "name" => "Bar"},
+            %{"child" => %{"id" => "foo", "name" => "Foo"}, "id" => "foo", "name" => "Foo"}
+          ]
+        }
+      }
+    }
+  ]
+
+  defmodule CustomSchema.Helpers do
+    @child %{id: "foo", name: "Foo"}
+
+    @items %{
+      "foo" => %{id: "foo", name: "Foo", child: @child},
+      "bar" => %{id: "bar", name: "Bar", child: @child}
+    }
+
+    def by_id(_model, ids) do
+      @items
+      |> Map.values()
+      |> Enum.filter(fn item -> item.id in ids end)
+    end
+  end
+
+  defmodule CustomSchema do
+    use Absinthe.Schema
+
+    @child %{id: "foo", name: "Foo"}
+
+    @items %{
+      "foo" => %{id: "foo", name: "Foo", child: @child},
+      "bar" => %{id: "bar", name: "Bar", child: @child}
+    }
+
+    query do
+      field :items, list_of(:item) do
+        resolve fn _, _ ->
+          {:ok, Map.values(@items)}
+        end
+      end
+    end
+
+    object :item do
+      field :id, :id
+      field :name, :string
+
+      field :child, :child_item do
+        resolve fn item, _, _ ->
+          batch({CustomSchema.Helpers, :by_id}, item.id, fn batch_results ->
+            result = Enum.find(batch_results, fn r -> r.id == item.id end)
+            {:ok, result}
+          end)
+        end
+      end
+    end
+
+    object :child_item do
+      field :id, :id
+      field :name, :string
+    end
+  end
+
+  defmodule CustomValidationResult do
+    alias Absinthe.Blueprint
+
+    use Absinthe.Phase
+
+    def run(blueprint, opts) do
+      skipped_phases = Keyword.fetch!(opts, :phases)
+
+      blueprint =
+        blueprint
+        |> Blueprint.prewalk([], &handle_node/2)
+        |> filter_errors(skipped_phases)
+
+      case blueprint.execution.validation_errors do
+        [] ->
+          {:ok, blueprint}
+
+        _ ->
+          {:jump, blueprint, Absinthe.Phase.Document.Result}
+      end
+    end
+
+    defp handle_node(%{errors: errs} = node, errors) do
+      {node, :lists.reverse(errs) ++ errors}
+    end
+
+    defp handle_node(%{raw: raw} = node, errors) do
+      {_, errors} = Blueprint.prewalk(raw, errors, &handle_node/2)
+      {node, errors}
+    end
+
+    defp handle_node(node, acc), do: {node, acc}
+
+    defp filter_errors({blueprint, errors}, skipped_phases) do
+      {skipped_errors, filtered_errors} =
+        Enum.split_with(
+          errors,
+          &(&1.phase in skipped_phases)
+        )
+
+      blueprint.execution.validation_errors
+      |> put_in(:lists.reverse(filtered_errors))
+      |> add_skipped_validations_to_operations(skipped_errors)
+    end
+
+    defp add_skipped_validations_to_operations(blueprint, skipped_errors) do
+      Absinthe.Blueprint.update_current(
+        blueprint,
+        &put_in(&1, [Access.key(:skipped_validation_errors)], skipped_errors)
+      )
+    end
+  end
+
+  defmodule CustomPipeline do
+    def pipeline(config, opts) do
+      config
+      |> Absinthe.Plug.default_pipeline(opts)
+      |> Absinthe.Pipeline.replace(
+        Absinthe.Phase.Document.Validation.Result,
+        {CustomValidationResult, phases: [Absinthe.Phase.Document.Validation.NoUnusedFragments]}
+      )
+    end
+  end
+
+  test "can include unused fragment with skip directive" do
+    opts = Absinthe.Plug.init(schema: CustomSchema, pipeline: {CustomPipeline, :pipeline})
+
+    assert %{status: 200, resp_body: resp_body} =
+             conn(:post, "/", @unused_fragment_query_with_directive)
+             |> put_req_header("content-type", "application/json")
+             |> plug_parser()
+             |> absinthe_plug(opts)
+
+    assert @unused_fragment_query_with_directive_result == resp_body
+  end
+
   test "returns 400 with invalid batch structure" do
     opts = Absinthe.Plug.init(schema: TestSchema)
 
